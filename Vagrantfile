@@ -1,21 +1,25 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
+box = "ubuntu/xenial64"
+box_ver = "20191204.0.0"
+head_ip = "192.168.205.10"
+
 servers = [
     {
         :name => "k8s-head",
         :type => "master",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
-        :eth1 => "192.168.205.10",
+        :box => box,
+        :box_version => box_ver,
+        :eth1 => head_ip,
         :mem => "2048",
         :cpu => "2"
     },
     {
         :name => "k8s-node-1",
         :type => "node",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
+        :box => box,
+        :box_version => box_ver,
         :eth1 => "192.168.205.11",
         :mem => "2048",
         :cpu => "2"
@@ -23,8 +27,8 @@ servers = [
     {
         :name => "k8s-node-2",
         :type => "node",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
+        :box => box,
+        :box_version => box_ver,
         :eth1 => "192.168.205.12",
         :mem => "2048",
         :cpu => "2"
@@ -38,9 +42,10 @@ $configureBox = <<-SCRIPT
     # reason for not using docker provision is that it always installs latest version of the docker, but kubeadm requires 17.03 or older
     apt-get update
     apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-    add-apt-repository "deb https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(lsb_release -cs) stable"
-    apt-get update && apt-get install -y docker-ce=$(apt-cache madison docker-ce | grep 17.03 | head -1 | awk '{print $3}')
+    # curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    # add-apt-repository "deb https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(lsb_release -cs) stable"
+    # apt-get update && apt-get install -y docker-ce=$(apt-cache madison docker-ce | grep 17.03 | head -1 | awk '{print $3}')
+    curl -fsSL https://get.docker.com | sudo sh
 
     # run docker commands as vagrant user (sudo not required)
     usermod -aG docker vagrant
@@ -59,12 +64,28 @@ EOF
     swapoff -a
 
     # keep swap off after reboot
-    sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    #sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    
+    # https://kubernetes.io/docs/setup/production-environment/container-runtimes/
+    cat > /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+    mkdir -p /etc/systemd/system/docker.service.d
+    systemctl daemon-reload
+    systemctl restart docker
+
 
     # ip of this box
     IP_ADDR=`ifconfig enp0s8 | grep Mask | awk '{print $2}'| cut -f2 -d:`
     # set node-ip
-    sudo sed -i "/^[^#]*KUBELET_EXTRA_ARGS=/c\KUBELET_EXTRA_ARGS=--node-ip=$IP_ADDR" /etc/default/kubelet
+    echo "KUBELET_EXTRA_ARGS=--node-ip=$IP_ADDR" | sudo tee /etc/default/kubelet
     sudo systemctl restart kubelet
 SCRIPT
 
@@ -72,35 +93,46 @@ $configureMaster = <<-SCRIPT
     echo "This is master"
     # ip of this box
     IP_ADDR=`ifconfig enp0s8 | grep Mask | awk '{print $2}'| cut -f2 -d:`
+    echo $IP_ADDR
 
-    # install k8s master
-    HOST_NAME=$(hostname -s)
-    kubeadm init --apiserver-advertise-address=$IP_ADDR --apiserver-cert-extra-sans=$IP_ADDR  --node-name $HOST_NAME --pod-network-cidr=172.16.0.0/16
+    # # install k8s master
+    kubeadm init --apiserver-advertise-address=$IP_ADDR --apiserver-cert-extra-sans=$IP_ADDR  --node-name=$HOSTNAME --pod-network-cidr=172.16.0.0/16
 
-    #copying credentials to regular user - vagrant
+    sleep 30s
+
+    # #copying credentials to regular user - vagrant
     sudo --user=vagrant mkdir -p /home/vagrant/.kube
     cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
     chown $(id -u vagrant):$(id -g vagrant) /home/vagrant/.kube/config
 
-    # install Calico pod network addon
+    # # install Calico pod network addon
     export KUBECONFIG=/etc/kubernetes/admin.conf
-    kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/rbac-kdd.yaml
-    kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/calico.yaml
+    kubectl apply -f https://docs.projectcalico.org/v3.9/manifests/calico.yaml
+
+    sleep 60s
+
+    # kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/rbac-kdd.yaml
+    # kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/calico.yaml
 
     kubeadm token create --print-join-command >> /etc/kubeadm_join_cmd.sh
     chmod +x /etc/kubeadm_join_cmd.sh
 
-    # required for setting up password less ssh between guest VMs
+    # # required for setting up password less ssh between guest VMs
     sudo sed -i "/^[^#]*PasswordAuthentication[[:space:]]no/c\PasswordAuthentication yes" /etc/ssh/sshd_config
-    sudo service sshd restart
+    sudo systemctl restart sshd
 
 SCRIPT
 
 $configureNode = <<-SCRIPT
-    echo "This is worker"
-    apt-get install -y sshpass
-    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@192.168.205.10:/etc/kubeadm_join_cmd.sh .
-    sh ./kubeadm_join_cmd.sh
+    IP_ADDR=`ifconfig enp0s8 | grep Mask | awk '{print $2}'| cut -f2 -d:`
+    echo "This is worker: ${IP_ADDR}"
+    sudo apt update
+    sudo apt-get install -y sshpass
+    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@#{head_ip}:/etc/kubeadm_join_cmd.sh .
+    sudo sh ./kubeadm_join_cmd.sh
+    sudo rm -f ./kubeadm_join_cmd.sh
+    sleep 40s
+    sudo systemctl restart kubelet
 SCRIPT
 
 Vagrant.configure("2") do |config|
@@ -116,14 +148,11 @@ Vagrant.configure("2") do |config|
             config.vm.provider "virtualbox" do |v|
 
                 v.name = opts[:name]
-            	 v.customize ["modifyvm", :id, "--groups", "/Ballerina Development"]
+            	v.customize ["modifyvm", :id, "--groups", "/RandallDevelopment"]
                 v.customize ["modifyvm", :id, "--memory", opts[:mem]]
                 v.customize ["modifyvm", :id, "--cpus", opts[:cpu]]
 
             end
-
-            # we cannot use this because we can't install the docker version we want - https://github.com/hashicorp/vagrant/issues/4871
-            #config.vm.provision "docker"
 
             config.vm.provision "shell", inline: $configureBox
 
@@ -138,3 +167,4 @@ Vagrant.configure("2") do |config|
     end
 
 end 
+
